@@ -1,0 +1,47 @@
+# macOS and editor files
+.DS_Store
+.AppleDouble
+.LSOverride
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local scratch and archive folders
+99_Temp/
+90_Archive/
+
+# Upstream source mirror. Keep upstream as an external reference instead of
+# vendoring the whole PAROL6 repository into this work log.
+02_Source/01_PAROL6_Desktop_Robot_Arm__Upstream/
+
+# PlatformIO and firmware build artifacts
+**/.pio/
+**/.pioenvs/
+**/.piolibdeps/
+**/.sconsign*.dblite
+**/build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Generated or bulky vendor documentation
+**/lib/*/.nojekyll
+**/lib/*/Doxyfile
+**/lib/*/doc/
+**/lib/*/docs/
+**/lib/*/examples/
+**/lib/*/extras/
+**/lib/*/extras/doc/
+
+# Downloaded vendor installers and temporary bundles
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.dmg
+
+# Logs and local outputs
+*.log
+07_Output/
