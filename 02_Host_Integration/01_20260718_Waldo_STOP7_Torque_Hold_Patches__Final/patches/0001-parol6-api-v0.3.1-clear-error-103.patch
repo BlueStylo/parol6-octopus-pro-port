@@ -1,0 +1,1438 @@
+diff --git a/parol6/commands/base.py b/parol6/commands/base.py
+index 28512df..77ac351 100644
+--- a/parol6/commands/base.py
++++ b/parol6/commands/base.py
+@@ -337,15 +337,21 @@ class SystemCommand(CommandBase[P]):
+     System commands control the overall state of the robot controller (enable/disable, stop, etc.)
+     and can execute even when the controller is disabled.
+ 
+-    Side-effect signaling: commands that need infrastructure changes (simulator toggle,
+-    port switch, mock sync) set the corresponding attribute. The controller reads these
+-    after tick() and orchestrates the actual change.
++    Side-effect signaling: commands that need infrastructure changes or
++    ordered one-shot firmware commands set the corresponding attribute. The
++    controller reads these after tick() and orchestrates the actual change.
+     """
+ 
+-    __slots__ = ("_switch_simulator", "_switch_port", "_sync_mock")
++    __slots__ = (
++        "_switch_simulator",
++        "_switch_port",
++        "_sync_mock",
++        "_firmware_commands",
++    )
+ 
+     def __init__(self, p: P) -> None:
+         super().__init__(p)
+         self._switch_simulator: bool | None = None
+         self._switch_port: str | None = None
+         self._sync_mock: bool = False
++        self._firmware_commands: tuple[CommandCode, ...] = ()
+diff --git a/parol6/commands/system_commands.py b/parol6/commands/system_commands.py
+index f9f0d93..a8ff057 100644
+--- a/parol6/commands/system_commands.py
++++ b/parol6/commands/system_commands.py
+@@ -47,6 +47,7 @@ class ResumeCommand(SystemCommand[ResumeCmd]):
+         state.enabled = True
+         state.disabled_reason = ""
+         state.Command_out = CommandCode.ENABLE
++        self._firmware_commands = (CommandCode.ENABLE,)
+ 
+         self.finish()
+         return ExecutionStatusCode.COMPLETED
+@@ -54,18 +55,25 @@ class ResumeCommand(SystemCommand[ResumeCmd]):
+ 
+ @register_command(CmdType.HALT)
+ class HaltCommand(SystemCommand[HaltCmd]):
+-    """Halt the robot — stop all motion and disable."""
++    """Stop commanded motion while preserving firmware holding torque.
++
++    The zero-mask JOG is an intentional one-shot stop marker: production
++    firmware treats recurring IDLE as CONTINUING during HOME, while JOG with
++    no affected joints clears homing without emitting steps or disabling EN.
++    """
+ 
+     PARAMS_TYPE = HaltCmd
+ 
+     __slots__ = ()
+ 
+     def execute_step(self, state: ControllerState) -> ExecutionStatusCode:
+-        logger.info("HALT command executed")
++        logger.info("HALT command executed (torque-holding motion stop)")
+         state.Speed_out.fill(0)
++        state.Affected_joint_out.fill(0)
+         state.enabled = False
+-        state.disabled_reason = "User requested halt"
+-        state.Command_out = CommandCode.DISABLE
++        state.disabled_reason = "Digital motion stop; RESUME required"
++        state.Command_out = CommandCode.IDLE
++        self._firmware_commands = (CommandCode.JOG, CommandCode.IDLE)
+ 
+         self.finish()
+         return ExecutionStatusCode.COMPLETED
+diff --git a/parol6/commands/utility_commands.py b/parol6/commands/utility_commands.py
+index 15134b1..e4be633 100644
+--- a/parol6/commands/utility_commands.py
++++ b/parol6/commands/utility_commands.py
+@@ -55,7 +55,10 @@ class DelayCommand(CommandBase[DelayCmd]):
+ @register_command(CmdType.RESET)
+ class ResetCommand(SystemCommand[ResetCmd]):
+     """
+-    Instantly reset controller state to initial values.
++    Reset host state and request an explicit firmware reset edge.
++
++    IDLE arms/releases the edge around CLEAR_ERROR. Firmware reset is
++    deliberately ready-disarmed; a separate RESUME must later send ENABLE.
+     """
+ 
+     PARAMS_TYPE = ResetCmd
+@@ -64,6 +67,15 @@ class ResetCommand(SystemCommand[ResetCmd]):
+ 
+     def execute_step(self, state: "ControllerState") -> ExecutionStatusCode:
+         state.reset()
++        state.enabled = False
++        state.disabled_reason = "Firmware reset; RESUME required"
++        state.InOut_in[4] = 0
++        state.Command_out = CommandCode.IDLE
++        self._firmware_commands = (
++            CommandCode.IDLE,
++            CommandCode.CLEAR_ERROR,
++            CommandCode.IDLE,
++        )
+         self._sync_mock = True
+         self.finish()
+         return ExecutionStatusCode.COMPLETED
+diff --git a/parol6/protocol/wire.py b/parol6/protocol/wire.py
+index 4f4307d..2233970 100644
+--- a/parol6/protocol/wire.py
++++ b/parol6/protocol/wire.py
+@@ -1561,6 +1561,7 @@ class CommandCode(IntEnum):
+     HOME = 100
+     ENABLE = 101
+     DISABLE = 102
++    CLEAR_ERROR = 103
+     JOG = 123
+     MOVE = 156
+     TELEPORT = 200
+diff --git a/parol6/server/controller.py b/parol6/server/controller.py
+index 7808e2d..695d3a7 100644
+--- a/parol6/server/controller.py
++++ b/parol6/server/controller.py
+@@ -5,6 +5,7 @@ Runs the fixed-rate control loop, dispatches UDP commands to the command
+ executor, and manages serial/simulator transport and status broadcasting.
+ """
+ 
++from collections import deque
+ import logging
+ import signal
+ import sys
+@@ -23,7 +24,7 @@ from parol6.commands.base import (
+     SystemCommand,
+ )
+ from parol6.commands.shape_commands import SetShapesCommand
+-from parol6.commands.system_commands import SelectProfileCommand
++from parol6.commands.system_commands import HaltCommand, SelectProfileCommand
+ from parol6.commands.utility_commands import ResetCommand
+ from parol6.server.command_executor import CommandExecutor, QueueFullError
+ from parol6.server.motion_planner import MotionPlanner, PlanCommand
+@@ -124,6 +125,12 @@ class Controller:
+         # Start as released to avoid a false positive on the first check
+         self.estop_active: bool = False
+ 
++        # System commands are otherwise overwritten by _execute_commands()
++        # before the serial write phase. Keep them ordered, retry on a failed
++        # transport write, and consume exactly one item after a successful
++        # 56-byte frame write.
++        self._firmware_command_queue: deque[CommandCode] = deque()
++
+         self._status_broadcaster: Any | None = None
+ 
+         self._timer = LoopTimer(self.config.loop_interval)
+@@ -186,6 +193,10 @@ class Controller:
+             self.state_manager.reset_state()
+ 
+             self._transport_mgr.initialize()
++            self._apply_transport_motion_gate(
++                self.state_manager.get_state(),
++                "Hardware startup; explicit RESUME required",
++            )
+ 
+             try:
+                 logger.debug(
+@@ -216,6 +227,30 @@ class Controller:
+         """Check if controller is properly initialized."""
+         return self._initialized
+ 
++    def _apply_transport_motion_gate(
++        self,
++        state: ControllerState,
++        hardware_reason: str,
++        *,
++        enable_simulator: bool = True,
++    ) -> None:
++        """Apply safe startup/reconnect policy for the active transport.
++
++        The simulator remains immediately usable for existing API/test flows.
++        A real or absent transport always starts host-disabled so an API
++        restart cannot turn firmware's ResumeRequired state into an accepted
++        motion command.
++        """
++        state.Command_out = CommandCode.IDLE
++        state.Speed_out.fill(0)
++        if isinstance(self._transport_mgr.transport, MockSerialTransport):
++            state.enabled = enable_simulator
++            if enable_simulator:
++                state.disabled_reason = ""
++        else:
++            state.enabled = False
++            state.disabled_reason = hardware_reason
++
+     def start(self):
+         """Start the main control loop."""
+         if self.running:
+@@ -326,9 +361,16 @@ class Controller:
+         if self._transport_mgr.auto_reconnect():
+             # Flush stale commands so the robot doesn't replay old moves
+             self._segment_player.cancel(state)
+-            self._planner.cancel()
+             self._executor.cancel_active_command("Serial reconnect")
+             self._executor.clear_queue("Serial reconnect")
++            self._firmware_command_queue.clear()
++            self._tool_cmd = None
++            self._tool_cmd_activated = False
++            self._apply_transport_motion_gate(
++                state,
++                "Hardware reconnected; explicit RESUME required",
++                enable_simulator=state.enabled,
++            )
+ 
+     def _handle_estop(self, state: ControllerState) -> None:
+         """Phase 2: Handle E-stop activation and recovery."""
+@@ -338,10 +380,15 @@ class Controller:
+         ):
+             return
+ 
+-        if state.InOut_in[4] == 0:  # E-stop pressed
++        if state.InOut_in[4] == 0:  # STOP7/E-stop latch active
+             if not self.estop_active:
+-                logger.warning("E-STOP activated")
++                logger.warning("STOP7 / E-STOP latch activated")
+                 self.estop_active = True
++                # A new STOP7/boot safety-latch transition preempts stale
++                # system pulses.
++                # Do not send DISABLE here: Exp19 stops STEP generation while
++                # preserving driver enable/holding torque for the active axes.
++                self._firmware_command_queue.clear()
+                 self._segment_player.cancel(state)
+                 self._planner.sync_tool(
+                     state.current_tool,
+@@ -352,15 +399,38 @@ class Controller:
+                 if self._executor.active_command:
+                     self._executor.cancel_active_command("E-Stop activated")
+                 self._executor.clear_queue("E-Stop activated")
+-                state.Command_out = CommandCode.DISABLE
+-                state.Speed_out.fill(0)
++                self._tool_cmd = None
++                self._tool_cmd_activated = False
++
++            # Enforce the latched host state on every tick. A RESUME received
++            # while STOP7 is still latched must neither arm the host nor leave
++            # a deferred ENABLE that can replay after a later reset.
++            if CommandCode.ENABLE in self._firmware_command_queue:
++                self._firmware_command_queue = deque(
++                    command
++                    for command in self._firmware_command_queue
++                    if command != CommandCode.ENABLE
++                )
++            state.enabled = False
++            state.e_stop_active = True
++            state.disabled_reason = "STOP7 / E-STOP latched; RESET and RESUME required"
++            state.Command_out = CommandCode.IDLE
++            state.Speed_out.fill(0)
++            state.action_current = ""
++            state.action_params = ""
++            state.action_state = ActionState.ERROR
++            if (
++                state.error is None
++                or state.error.code != ErrorCode.SYS_ESTOP_ACTIVE
++            ):
+                 state.error = make_error(ErrorCode.SYS_ESTOP_ACTIVE)
+-        elif state.InOut_in[4] == 1:  # E-stop released
++        elif state.InOut_in[4] == 1:  # Explicit reset acknowledgement
+             if self.estop_active:
+-                logger.info("E-STOP released - automatic recovery")
++                logger.info("STOP7 / E-STOP latch cleared by explicit reset")
+                 self.estop_active = False
+-                state.enabled = True
+-                state.disabled_reason = ""
++                state.enabled = False
++                state.e_stop_active = False
++                state.disabled_reason = "E-STOP reset accepted; RESUME required"
+                 state.Command_out = CommandCode.IDLE
+                 state.Speed_out.fill(0)
+                 if (
+@@ -368,9 +438,20 @@ class Controller:
+                     and state.error.code == ErrorCode.SYS_ESTOP_ACTIVE
+                 ):
+                     state.error = None
++                    state.action_current = ""
++                    state.action_params = ""
++                    state.action_state = ActionState.IDLE
+ 
+     def _execute_commands(self, state: ControllerState) -> None:
+         """Phase 3: Execute active command."""
++        # Disabled host state is a hard execution boundary. Firmware one-shot
++        # commands (RESET, torque-holding HALT marker, RESUME) still flow via
++        # _write_to_firmware(), but no planner/executor/tool producer may tick.
++        if not state.enabled:
++            state.Command_out = CommandCode.IDLE
++            state.Speed_out.fill(0)
++            return
++
+         # Tool action side channel — ticks concurrently with everything
+         self._tick_tool_cmd(state)
+ 
+@@ -421,16 +502,25 @@ class Controller:
+ 
+     def _write_to_firmware(self, state: ControllerState) -> None:
+         """Phase 4: Write state to serial transport."""
++        queue_ready = (
++            self._firmware_command_queue
++            and self._transport_mgr.first_frame_received
++        )
++        firmware_command = (
++            self._firmware_command_queue[0] if queue_ready else state.Command_out
++        )
+         ok = self._transport_mgr.write_frame(
+             state.Position_out,
+             state.Speed_out,
+-            state.Command_out.value,
++            firmware_command.value,
+             state.Affected_joint_out,
+             state.InOut_out,
+             state.Timeout_out,
+             state.Gripper_data_out,
+         )
+         if ok:
++            if queue_ready:
++                self._firmware_command_queue.popleft()
+             # Auto-reset one-shot gripper modes after successful send
+             if state.Gripper_data_out[4] in (1, 2):
+                 state.Gripper_data_out[4] = 0
+@@ -779,9 +869,30 @@ class Controller:
+     ) -> None:
+         """Execute system command, apply side effects, and send reply."""
+         try:
++            if (
++                isinstance(command, ResetCommand)
++                and not self._transport_mgr.first_frame_received
++            ):
++                raise RuntimeError("RESET requires a decoded telemetry frame")
++
+             command.setup(state)
+             code = command.tick(state)
+ 
++            if code == ExecutionStatusCode.COMPLETED:
++                if isinstance(command, (ResetCommand, HaltCommand)):
++                    self._firmware_command_queue.clear()
++                self._firmware_command_queue.extend(command._firmware_commands)
++
++            # Digital HALT is a torque-holding motion stop, not a driver
++            # disable. Cancel every host-side producer synchronously so no
++            # stale MoveJ, stream, HOME, or tool action can resume later.
++            if isinstance(command, HaltCommand):
++                self._segment_player.cancel(state)
++                self._executor.cancel_active_command("Digital motion stop")
++                self._executor.clear_queue("Digital motion stop")
++                self._tool_cmd = None
++                self._tool_cmd_activated = False
++
+             # Reset: cancel motion pipeline so stale segments don't play.
+             # Also sync the (now-cleared) tool state to the planner subprocess
+             # so its PAROL6_ROBOT singleton matches the controller's.
+@@ -789,6 +900,8 @@ class Controller:
+                 self._segment_player.cancel(state)
+                 self._executor.cancel_active_command("Reset")
+                 self._executor.clear_queue("Reset")
++                self._tool_cmd = None
++                self._tool_cmd_activated = False
+                 self._planner.sync_tool(
+                     state.current_tool,
+                     variant_key=state.current_tool_variant,
+@@ -798,6 +911,8 @@ class Controller:
+ 
+             # Infrastructure side effects (only 2-3 commands trigger these)
+             if command._switch_simulator is not None:
++                # Never replay a one-shot command on a different transport.
++                self._firmware_command_queue.clear()
+                 state.Command_out = CommandCode.IDLE
+                 state.Speed_out.fill(0)
+                 self._segment_player.cancel(state)
+@@ -808,8 +923,23 @@ class Controller:
+                 )
+                 if not success:
+                     raise RuntimeError(error or "Simulator toggle failed")
++                self._apply_transport_motion_gate(
++                    state,
++                    "Hardware mode selected; explicit RESUME required",
++                )
+             if command._switch_port is not None:
++                # A manually selected device starts with a fresh handshake.
++                self._firmware_command_queue.clear()
++                self._segment_player.cancel(state)
++                self._executor.cancel_active_command("Hardware port switch")
++                self._executor.clear_queue("Hardware port switch")
++                self._tool_cmd = None
++                self._tool_cmd_activated = False
+                 self._transport_mgr.switch_to_port(command._switch_port)
++                self._apply_transport_motion_gate(
++                    state,
++                    "Hardware port changed; explicit RESUME required",
++                )
+             if command._sync_mock:
+                 self._transport_mgr.sync_mock_from_state(state)
+ 
+diff --git a/parol6/server/motion_planner.py b/parol6/server/motion_planner.py
+index 9454bac..9df6794 100644
+--- a/parol6/server/motion_planner.py
++++ b/parol6/server/motion_planner.py
+@@ -57,6 +57,7 @@ class TrajectorySegment:
+     command_name: str = ""
+     action_params: str = ""
+     blend_consumed_indices: list[int] = field(default_factory=list)
++    generation: int = 0
+ 
+ 
+ @dataclass
+@@ -65,6 +66,7 @@ class InlineSegment:
+ 
+     command_index: int
+     params: object  # wire struct (msgspec.Struct — picklable)
++    generation: int = 0
+ 
+ 
+ @dataclass
+@@ -76,6 +78,7 @@ class ErrorSegment:
+     cartesian_path: np.ndarray | None = None  # (N, 6) full TCP path
+     ik_valid: np.ndarray | None = None  # (N,) per-pose bool
+     colliding_pairs: list[tuple[str, str]] | None = None  # self-collision viz
++    generation: int = 0
+ 
+ 
+ Segment = Union[TrajectorySegment, InlineSegment, ErrorSegment]
+@@ -94,6 +97,7 @@ class PlanCommand:
+     position_in: np.ndarray | None = (
+         None  # current Position_in (None = use planner internal)
+     )
++    generation: int = 0
+ 
+ 
+ @dataclass
+@@ -130,6 +134,8 @@ class SyncShapes:
+ class CancelAll:
+     """Clear the planner's internal state and discard pending work."""
+ 
++    generation: int = 0
++
+ 
+ PlannerMessage = Union[
+     PlanCommand, SyncPosition, SyncProfile, SyncTool, SyncShapes, CancelAll
+@@ -506,6 +512,7 @@ class PlannerWorker:
+     def __init__(self, segment_queue: multiprocessing.Queue) -> None:
+         self._segment_queue = segment_queue
+         self._planner = TrajectoryPlanner(diagnostic=False)
++        self._generation = 0
+ 
+     @property
+     def state(self) -> PlannerState:
+@@ -513,21 +520,26 @@ class PlannerWorker:
+ 
+     def process_command(self, msg: PlanCommand) -> None:
+         """Route a PlanCommand through the planner and emit segments."""
++        self._generation = msg.generation
+         if msg.position_in is not None:
+             self._planner.state.Position_in[:] = msg.position_in
+ 
+         segments = self._planner.process(msg.params, msg.command_index)
+         for seg in segments:
++            seg.generation = msg.generation
+             self._segment_queue.put(seg)
+ 
+     def flush_stale_blend(self) -> None:
+         """Flush any pending blend buffer (called on queue timeout)."""
+         segments = self._planner.flush()
+         for seg in segments:
++            seg.generation = self._generation
+             self._segment_queue.put(seg)
+ 
+-    def cancel(self) -> None:
++    def cancel(self, generation: int | None = None) -> None:
+         """Clear blend buffer on CancelAll."""
++        if generation is not None:
++            self._generation = generation
+         self._planner.cancel()
+ 
+     def apply_tool(
+@@ -610,7 +622,7 @@ def motion_planner_main(
+                 continue
+ 
+             if isinstance(msg, CancelAll):
+-                worker.cancel()
++                worker.cancel(msg.generation)
+                 continue
+ 
+             if isinstance(msg, SyncPosition):
+@@ -652,9 +664,10 @@ def motion_planner_main(
+                         ErrorSegment(
+                             command_index=msg.command_index,
+                             error=robot_error,
++                            generation=msg.generation,
+                         )
+                     )
+-                    worker.cancel()
++                    worker.cancel(msg.generation)
+                     _drain_queue(command_queue)
+ 
+     except (EOFError, OSError, BrokenPipeError, KeyboardInterrupt):
+@@ -686,6 +699,10 @@ class MotionPlanner:
+         self._shutdown_event: EventType = multiprocessing.Event()
+         self._ready_event: EventType = multiprocessing.Event()
+         self._process: multiprocessing.Process | None = None
++        # Every cancel advances this epoch immediately in the main process.
++        # Segments computed by already-running older PlanCommands may arrive
++        # later, but poll_segment() will reject them deterministically.
++        self._generation: int = 0
+ 
+     # -- lifecycle --
+ 
+@@ -757,6 +774,8 @@ class MotionPlanner:
+ 
+     def submit(self, msg: PlannerMessage) -> None:
+         """Send a message to the planner (non-blocking)."""
++        if isinstance(msg, PlanCommand):
++            msg.generation = self._generation
+         self._command_queue.put_nowait(msg)
+ 
+     def sync_position(self, position_in: np.ndarray) -> None:
+@@ -788,16 +807,26 @@ class MotionPlanner:
+ 
+     def cancel(self) -> None:
+         """Cancel all pending work in the planner."""
+-        self.submit(CancelAll())
++        self._generation += 1
++        self.submit(CancelAll(generation=self._generation))
+ 
+     # -- planner → main --
+ 
+     def poll_segment(self) -> Segment | None:
+-        """Non-blocking poll for a computed segment. Returns None if empty."""
+-        try:
+-            return self._segment_queue.get_nowait()
+-        except queue.Empty:
+-            return None
++        """Return the next current-generation segment, dropping stale work."""
++        while True:
++            try:
++                segment = self._segment_queue.get_nowait()
++            except queue.Empty:
++                return None
++            if segment.generation == self._generation:
++                return segment
++            logger.debug(
++                "Discarded stale planner segment index=%d generation=%d current=%d",
++                segment.command_index,
++                segment.generation,
++                self._generation,
++            )
+ 
+ 
+ def _drain_queue(q: multiprocessing.Queue) -> None:
+diff --git a/parol6/server/segment_player.py b/parol6/server/segment_player.py
+index 3eb9ef5..8b869fb 100644
+--- a/parol6/server/segment_player.py
++++ b/parol6/server/segment_player.py
+@@ -330,6 +330,12 @@ class SegmentPlayer:
+         self._planner.cancel()
+         # Drain stale segments from planner output queue
+         self._drain_planner_queue(state)
++        # Cancellation is terminal for the active action.  Leaving these
++        # fields untouched made a cancelled MoveJ appear EXECUTING forever
++        # even though both the player and planner queues were empty.
++        state.action_current = ""
++        state.action_params = ""
++        state.action_state = ActionState.IDLE
+ 
+     def _drain_planner_queue(self, state: ControllerState) -> None:
+         """Drain any remaining segments from the planner's output queue."""
+diff --git a/parol6/server/state.py b/parol6/server/state.py
+index 41c9b72..b0936ce 100644
+--- a/parol6/server/state.py
++++ b/parol6/server/state.py
+@@ -159,9 +159,11 @@ class ControllerState:
+     last_reconnect_attempt: float = 0.0
+ 
+     # Safety and control flags
+-    enabled: bool = True
++    # A fresh host must never accept motion until its transport policy has
++    # explicitly enabled simulation or an operator has sent RESUME.
++    enabled: bool = False
+     soft_error: bool = False
+-    disabled_reason: str = ""
++    disabled_reason: str = "Explicit RESUME required"
+     e_stop_active: bool = False
+ 
+     # Motion profile for all moves (TOPPRA, RUCKIG, QUINTIC, TRAPEZOID, LINEAR)
+@@ -322,9 +324,9 @@ class ControllerState:
+         Resets: positions, speeds, I/O, queues, tool, errors, etc.
+         """
+         # Safety and control flags
+-        self.enabled = True
++        self.enabled = False
+         self.soft_error = False
+-        self.disabled_reason = ""
++        self.disabled_reason = "Explicit RESUME required"
+         self.e_stop_active = False
+         self.motion_profile = "TOPPRA"
+ 
+diff --git a/tests/integration/conftest.py b/tests/integration/conftest.py
+index 345c240..11eb462 100644
+--- a/tests/integration/conftest.py
++++ b/tests/integration/conftest.py
+@@ -13,6 +13,7 @@ def clean_state(server_proc, client):
+     Depends on server_proc to ensure server is ready before resetting.
+     """
+     client.reset()
++    client.resume()
+     client.select_profile("LINEAR")
+     idx = client.home()
+     assert idx >= 0, "Home command failed to send"
+diff --git a/tests/unit/test_controller_system_commands.py b/tests/unit/test_controller_system_commands.py
+index bc7e1f0..250427a 100644
+--- a/tests/unit/test_controller_system_commands.py
++++ b/tests/unit/test_controller_system_commands.py
+@@ -9,6 +9,7 @@ reads to trigger infrastructure changes.
+ from unittest.mock import patch
+ 
+ from parol6.commands.base import ExecutionStatusCode
++from parol6.protocol.wire import CommandCode
+ from parol6.server.state import ControllerState
+ 
+ 
+@@ -81,3 +82,43 @@ class TestSystemCommandSideEffects:
+ 
+         assert code == ExecutionStatusCode.COMPLETED
+         assert cmd._sync_mock is True
++        assert cmd._firmware_commands == (
++            CommandCode.IDLE,
++            CommandCode.CLEAR_ERROR,
++            CommandCode.IDLE,
++        )
++        assert state.Command_out == CommandCode.IDLE
++        assert state.enabled is False
++        assert state.disabled_reason == "Firmware reset; RESUME required"
++        assert state.InOut_in[4] == 0
++
++    def test_resume_queues_enable_firmware_command(self):
++        from parol6.commands.system_commands import ResumeCommand
++        from parol6.protocol.wire import ResumeCmd
++
++        cmd = ResumeCommand(ResumeCmd())
++        state = ControllerState()
++
++        code = cmd.execute_step(state)
++
++        assert code == ExecutionStatusCode.COMPLETED
++        assert cmd._firmware_commands == (CommandCode.ENABLE,)
++
++    def test_halt_queues_zero_mask_jog_then_idle_without_disabling(self):
++        from parol6.commands.system_commands import HaltCommand
++        from parol6.protocol.wire import HaltCmd
++
++        cmd = HaltCommand(HaltCmd())
++        state = ControllerState()
++        state.Speed_out.fill(123)
++        state.Affected_joint_out.fill(1)
++
++        code = cmd.execute_step(state)
++
++        assert code == ExecutionStatusCode.COMPLETED
++        assert cmd._firmware_commands == (CommandCode.JOG, CommandCode.IDLE)
++        assert state.Command_out == CommandCode.IDLE
++        assert state.enabled is False
++        assert state.disabled_reason == "Digital motion stop; RESUME required"
++        assert not state.Speed_out.any()
++        assert not state.Affected_joint_out.any()
+diff --git a/tests/unit/test_firmware_system_wire.py b/tests/unit/test_firmware_system_wire.py
+new file mode 100644
+index 0000000..581afcd
+--- /dev/null
++++ b/tests/unit/test_firmware_system_wire.py
+@@ -0,0 +1,482 @@
++"""Regression tests for one-shot firmware system commands."""
++
++from collections import deque
++from types import SimpleNamespace
++
++import numpy as np
++from waldoctl import ActionState
++
++from parol6.commands.system_commands import HaltCommand, ResumeCommand
++from parol6.commands.utility_commands import ResetCommand
++from parol6.protocol.wire import (
++    CheckpointCmd,
++    CommandCode,
++    HaltCmd,
++    ResetCmd,
++    ResumeCmd,
++    pack_tx_frame_into,
++)
++from parol6.server.controller import Controller
++from parol6.server.motion_planner import MotionPlanner
++from parol6.server.segment_player import SegmentPlayer
++from parol6.server.state import ControllerState
++from parol6.server.transports.mock_serial_transport import MockSerialTransport
++from parol6.utils.error_codes import ErrorCode
++
++
++class RecordingTransportManager:
++    def __init__(self, results):
++        self.results = deque(results)
++        self.commands = []
++        self.first_frame_received = True
++
++    def write_frame(
++        self,
++        position_out,
++        speed_out,
++        command_value,
++        affected_joint_out,
++        inout_out,
++        timeout_out,
++        gripper_data_out,
++    ):
++        self.commands.append(command_value)
++        return self.results.popleft()
++
++
++def bare_controller(write_results):
++    controller = Controller.__new__(Controller)
++    controller._transport_mgr = RecordingTransportManager(write_results)
++    controller._firmware_command_queue = deque()
++    return controller
++
++
++def test_clear_error_uses_existing_56_byte_frame_layout():
++    out = bytearray(56)
++    zeros6 = np.zeros(6, dtype=np.int32)
++    zeros8 = np.zeros(8, dtype=np.uint8)
++    gripper = np.zeros(6, dtype=np.int32)
++
++    pack_tx_frame_into(
++        memoryview(out),
++        zeros6,
++        zeros6,
++        CommandCode.CLEAR_ERROR,
++        zeros8,
++        zeros8,
++        0,
++        gripper,
++    )
++
++    assert len(out) == 56
++    assert out[:4] == b"\xff\xff\xff\x34"
++    assert out[40] == 103
++    assert out[41:53] == bytes(12)
++    assert out[53:] == b"\xe4\x01\x02"
++
++
++def test_reset_sequence_arms_clears_and_releases_before_idle():
++    controller = bare_controller([True, True, True, True])
++    state = ControllerState()
++    controller._firmware_command_queue.extend(
++        [CommandCode.IDLE, CommandCode.CLEAR_ERROR, CommandCode.IDLE]
++    )
++
++    for _ in range(4):
++        controller._write_to_firmware(state)
++
++    assert controller._transport_mgr.commands == [255, 103, 255, 255]
++    assert not controller._firmware_command_queue
++
++
++def test_failed_write_retries_without_consuming_one_shot():
++    controller = bare_controller([False, True, True])
++    state = ControllerState()
++    controller._firmware_command_queue.extend(
++        [CommandCode.IDLE, CommandCode.CLEAR_ERROR, CommandCode.IDLE]
++    )
++
++    controller._write_to_firmware(state)
++    assert list(controller._firmware_command_queue) == [
++        CommandCode.IDLE,
++        CommandCode.CLEAR_ERROR,
++        CommandCode.IDLE,
++    ]
++
++    controller._write_to_firmware(state)
++    assert list(controller._firmware_command_queue) == [
++        CommandCode.CLEAR_ERROR,
++        CommandCode.IDLE,
++    ]
++
++    controller._write_to_firmware(state)
++    assert controller._transport_mgr.commands == [255, 255, 103]
++
++
++def test_queue_waits_for_first_telemetry_frame():
++    controller = bare_controller([True, True])
++    controller._transport_mgr.first_frame_received = False
++    state = ControllerState()
++    controller._firmware_command_queue.extend(
++        [CommandCode.IDLE, CommandCode.CLEAR_ERROR, CommandCode.IDLE]
++    )
++
++    controller._write_to_firmware(state)
++    assert controller._transport_mgr.commands == [255]
++    assert len(controller._firmware_command_queue) == 3
++
++    controller._transport_mgr.first_frame_received = True
++    controller._write_to_firmware(state)
++    assert controller._transport_mgr.commands == [255, 255]
++    assert list(controller._firmware_command_queue) == [
++        CommandCode.CLEAR_ERROR,
++        CommandCode.IDLE,
++    ]
++
++
++def test_system_commands_remain_ordered():
++    controller = bare_controller([True, True, True])
++    state = ControllerState()
++    controller._firmware_command_queue.extend(
++        [
++            CommandCode.DISABLE,
++            CommandCode.CLEAR_ERROR,
++            CommandCode.ENABLE,
++        ]
++    )
++
++    for _ in range(3):
++        controller._write_to_firmware(state)
++
++    assert controller._transport_mgr.commands == [102, 103, 101]
++    assert not controller._firmware_command_queue
++
++
++def test_digital_halt_cancels_host_motion_and_sends_jog_stop_marker():
++    class Recorder:
++        active_command = object()
++        active_cancelled = False
++        queue_cleared = False
++
++        def cancel_active_command(self, *args, **kwargs):
++            self.active_cancelled = True
++
++        def clear_queue(self, *args, **kwargs):
++            self.queue_cleared = True
++
++    class RecordingUDP:
++        def __init__(self):
++            self.sent = []
++
++        def send(self, payload, addr):
++            self.sent.append((payload, addr))
++
++    planner = MotionPlanner()
++    controller = Controller.__new__(Controller)
++    controller._firmware_command_queue = deque([CommandCode.ENABLE])
++    controller._planner = planner
++    controller._segment_player = SegmentPlayer(planner)
++    controller._executor = Recorder()
++    controller._tool_cmd = object()
++    controller._tool_cmd_activated = True
++    controller.udp_transport = RecordingUDP()
++
++    state = ControllerState()
++    state.action_current = "HomeCommand"
++    state.action_state = ActionState.EXECUTING
++    state.Speed_out.fill(123)
++    state.Affected_joint_out.fill(1)
++
++    controller._handle_system_command(
++        HaltCommand(HaltCmd()), state, ("127.0.0.1", 12345)
++    )
++
++    assert list(controller._firmware_command_queue) == [
++        CommandCode.JOG,
++        CommandCode.IDLE,
++    ]
++    assert state.Command_out == CommandCode.IDLE
++    assert state.enabled is False
++    assert state.disabled_reason == "Digital motion stop; RESUME required"
++    assert not state.Speed_out.any()
++    assert not state.Affected_joint_out.any()
++    assert planner._generation == 1
++    assert controller._executor.active_cancelled is True
++    assert controller._executor.queue_cleared is True
++    assert controller._tool_cmd is None
++    assert controller._tool_cmd_activated is False
++    assert len(controller.udp_transport.sent) == 1
++
++
++def test_reset_advances_planner_generation_and_clears_all_host_producers():
++    class ConnectedTransport:
++        first_frame_received = True
++        synced = False
++
++        def sync_mock_from_state(self, *args, **kwargs):
++            self.synced = True
++
++    class Executor:
++        active_cancelled = False
++        queue_cleared = False
++
++        def cancel_active_command(self, *args, **kwargs):
++            self.active_cancelled = True
++
++        def clear_queue(self, *args, **kwargs):
++            self.queue_cleared = True
++
++    class RecordingUDP:
++        def __init__(self):
++            self.sent = []
++
++        def send(self, payload, addr):
++            self.sent.append((payload, addr))
++
++    planner = MotionPlanner()
++    controller = Controller.__new__(Controller)
++    controller._planner = planner
++    controller._segment_player = SegmentPlayer(planner)
++    controller._executor = Executor()
++    controller._transport_mgr = ConnectedTransport()
++    controller._firmware_command_queue = deque([CommandCode.ENABLE])
++    controller._tool_cmd = object()
++    controller._tool_cmd_activated = True
++    controller.udp_transport = RecordingUDP()
++
++    state = ControllerState()
++    controller._handle_system_command(
++        ResetCommand(ResetCmd()), state, ("127.0.0.1", 12345)
++    )
++
++    assert planner._generation == 1
++    assert list(controller._firmware_command_queue) == [
++        CommandCode.IDLE,
++        CommandCode.CLEAR_ERROR,
++        CommandCode.IDLE,
++    ]
++    assert controller._executor.active_cancelled is True
++    assert controller._executor.queue_cleared is True
++    assert controller._tool_cmd is None
++    assert controller._tool_cmd_activated is False
++    assert controller._transport_mgr.synced is True
++    assert len(controller.udp_transport.sent) == 1
++
++
++def test_disabled_host_never_ticks_motion_producers():
++    class Recorder:
++        ticked = False
++
++        def tick(self, *args, **kwargs):
++            self.ticked = True
++            return True
++
++    controller = Controller.__new__(Controller)
++    controller._segment_player = Recorder()
++
++    state = ControllerState()
++    state.enabled = False
++    state.Command_out = CommandCode.MOVE
++    state.Speed_out.fill(123)
++
++    controller._execute_commands(state)
++
++    assert controller._segment_player.ticked is False
++    assert state.Command_out == CommandCode.IDLE
++    assert not state.Speed_out.any()
++
++
++def test_fresh_real_host_rejects_motion_until_explicit_resume():
++    class Motion:
++        _cmd_type = None
++        streamable = False
++        p = CheckpointCmd(label="startup-gate")
++
++    class Planner:
++        def __init__(self):
++            self.submitted = []
++
++        def submit(self, command):
++            self.submitted.append(command)
++
++    class Segment:
++        active = False
++
++    class Executor:
++        def cancel_active_streamable(self):
++            pass
++
++    controller = Controller.__new__(Controller)
++    controller._transport_mgr = SimpleNamespace(transport=object())
++    controller._planner = Planner()
++    controller._segment_player = Segment()
++    controller._executor = Executor()
++
++    state = ControllerState()
++    state.InOut_in[4] = 1
++    controller._apply_transport_motion_gate(
++        state, "Hardware startup; explicit RESUME required"
++    )
++
++    controller._handle_motion_command(Motion(), state, ("127.0.0.1", 12345))
++    assert state.enabled is False
++    assert state.disabled_reason == "Hardware startup; explicit RESUME required"
++    assert controller._planner.submitted == []
++
++    ResumeCommand(ResumeCmd()).execute_step(state)
++    controller._handle_motion_command(Motion(), state, ("127.0.0.1", 12345))
++    assert state.enabled is True
++    assert len(controller._planner.submitted) == 1
++
++
++def test_simulator_startup_remains_enabled():
++    controller = Controller.__new__(Controller)
++    controller._transport_mgr = SimpleNamespace(transport=MockSerialTransport())
++    state = ControllerState()
++
++    controller._apply_transport_motion_gate(
++        state, "Hardware startup; explicit RESUME required"
++    )
++
++    assert state.enabled is True
++    assert state.disabled_reason == ""
++
++
++def test_real_serial_reconnect_invalidates_motion_and_requires_resume():
++    class ReconnectedTransport:
++        transport = object()
++        first_frame_received = False
++        _last_version = 0
++
++        @staticmethod
++        def is_connected():
++            return False
++
++        @staticmethod
++        def auto_reconnect():
++            return True
++
++    class Executor:
++        active_cancelled = False
++        queue_cleared = False
++
++        def cancel_active_command(self, *args, **kwargs):
++            self.active_cancelled = True
++
++        def clear_queue(self, *args, **kwargs):
++            self.queue_cleared = True
++
++    planner = MotionPlanner()
++    controller = Controller.__new__(Controller)
++    controller._transport_mgr = ReconnectedTransport()
++    controller._planner = planner
++    controller._segment_player = SegmentPlayer(planner)
++    controller._executor = Executor()
++    controller._firmware_command_queue = deque([CommandCode.ENABLE])
++    controller._tool_cmd = object()
++    controller._tool_cmd_activated = True
++
++    state = ControllerState()
++    state.enabled = True
++    controller._read_from_firmware(state)
++
++    assert planner._generation == 1
++    assert state.enabled is False
++    assert state.disabled_reason == "Hardware reconnected; explicit RESUME required"
++    assert state.Command_out == CommandCode.IDLE
++    assert not controller._firmware_command_queue
++    assert controller._executor.active_cancelled is True
++    assert controller._executor.queue_cleared is True
++    assert controller._tool_cmd is None
++    assert controller._tool_cmd_activated is False
++
++
++def test_estop_preempts_queued_enable_without_disabling_firmware():
++    class ConnectedTransport:
++        first_frame_received = True
++
++        @staticmethod
++        def is_connected():
++            return True
++
++    class Recorder:
++        active_command = None
++        queue_cleared = False
++
++        def clear_queue(self, *args, **kwargs):
++            self.queue_cleared = True
++
++    planner = MotionPlanner()
++    controller = Controller.__new__(Controller)
++    controller._transport_mgr = ConnectedTransport()
++    controller._firmware_command_queue = deque([CommandCode.ENABLE])
++    controller._segment_player = SegmentPlayer(planner)
++    controller._planner = planner
++    controller._executor = Recorder()
++    controller._tool_cmd = object()
++    controller._tool_cmd_activated = True
++    controller.estop_active = False
++
++    state = ControllerState()
++    state.action_current = "MoveJCommand"
++    state.action_params = "angles=[...]"
++    state.action_state = ActionState.EXECUTING
++    state.Speed_out.fill(123)
++    state.InOut_in[4] = 0
++    controller._handle_estop(state)
++
++    assert not controller._firmware_command_queue
++    assert controller.estop_active is True
++    assert state.enabled is False
++    assert state.e_stop_active is True
++    assert state.disabled_reason == "STOP7 / E-STOP latched; RESET and RESUME required"
++    assert state.Command_out == CommandCode.IDLE
++    assert np.all(state.Speed_out == 0)
++    assert state.action_current == ""
++    assert state.action_params == ""
++    assert state.action_state == ActionState.ERROR
++    assert state.error is not None
++    assert state.error.code == ErrorCode.SYS_ESTOP_ACTIVE
++    assert planner._generation == 1
++    assert controller._executor.queue_cleared is True
++    assert controller._tool_cmd is None
++    assert controller._tool_cmd_activated is False
++
++
++def test_estop_latch_blocks_deferred_resume_until_reset_ack():
++    class ConnectedTransport:
++        first_frame_received = True
++
++        @staticmethod
++        def is_connected():
++            return True
++
++    controller = Controller.__new__(Controller)
++    controller._transport_mgr = ConnectedTransport()
++    controller._firmware_command_queue = deque([CommandCode.ENABLE])
++    controller.estop_active = True
++
++    state = ControllerState()
++    state.InOut_in[4] = 0
++    state.enabled = True
++    state.Command_out = CommandCode.ENABLE
++    controller._handle_estop(state)
++
++    assert CommandCode.ENABLE not in controller._firmware_command_queue
++    assert controller.estop_active is True
++    assert state.enabled is False
++    assert state.e_stop_active is True
++    assert state.Command_out == CommandCode.IDLE
++    assert state.action_state == ActionState.ERROR
++
++    # io[4] only returns high after firmware accepts explicit CLEAR_ERROR.
++    state.InOut_in[4] = 1
++    controller._handle_estop(state)
++
++    assert controller.estop_active is False
++    assert state.enabled is False
++    assert state.e_stop_active is False
++    assert state.disabled_reason == "E-STOP reset accepted; RESUME required"
++    assert state.Command_out == CommandCode.IDLE
++    assert state.error is None
++    assert state.action_state == ActionState.IDLE
+diff --git a/tests/unit/test_motion_pipeline.py b/tests/unit/test_motion_pipeline.py
+index 9e56c37..a22d516 100644
+--- a/tests/unit/test_motion_pipeline.py
++++ b/tests/unit/test_motion_pipeline.py
+@@ -5,10 +5,12 @@ state machine with mock segments.
+ """
+ 
+ import multiprocessing
++import queue
+ import time
+ 
+ import numpy as np
+ import pytest
++from waldoctl import ActionState
+ 
+ from parol6.config import deg_to_steps
+ from parol6.protocol.wire import (
+@@ -19,6 +21,8 @@ from parol6.protocol.wire import (
+     SelectToolCmd,
+ )
+ from parol6.server.motion_planner import (
++    CancelAll,
++    ErrorSegment,
+     InlineSegment,
+     MotionPlanner,
+     PlanCommand,
+@@ -79,7 +83,7 @@ class TestPlannerDirect:
+     def test_single_movej_produces_trajectory_segment(self, worker, segment_queue):
+         """A single MoveJ command should produce a TrajectorySegment."""
+         params = _make_movej_cmd(W1)
+-        msg = PlanCommand(command_index=0, params=params)
++        msg = PlanCommand(command_index=0, params=params, generation=12)
+ 
+         worker.process_command(msg)
+ 
+@@ -91,11 +95,12 @@ class TestPlannerDirect:
+         assert seg.trajectory_steps.dtype == np.int32
+         assert seg.duration > 0
+         assert seg.blend_consumed_indices == []
++        assert seg.generation == 12
+ 
+     def test_settool_produces_inline_segment(self, worker, segment_queue):
+         """SelectTool should produce an InlineSegment."""
+         params = SelectToolCmd(tool_name="PNEUMATIC")
+-        msg = PlanCommand(command_index=0, params=params)
++        msg = PlanCommand(command_index=0, params=params, generation=13)
+ 
+         worker.process_command(msg)
+ 
+@@ -103,6 +108,35 @@ class TestPlannerDirect:
+         assert isinstance(seg, InlineSegment)
+         assert seg.command_index == 0
+         assert isinstance(seg.params, SelectToolCmd)
++        assert seg.generation == 13
++
++    def test_error_segment_inherits_plan_generation(
++        self, worker, segment_queue, monkeypatch
++    ):
++        """Worker stamps failures with the originating plan generation."""
++        from parol6.utils.error_catalog import make_error
++        from parol6.utils.error_codes import ErrorCode
++
++        error = make_error(ErrorCode.MOTN_SETUP_FAILED, command_index=7)
++        monkeypatch.setattr(
++            worker._planner,
++            "process",
++            lambda params, command_index: [
++                ErrorSegment(command_index=command_index, error=error)
++            ],
++        )
++
++        worker.process_command(
++            PlanCommand(
++                command_index=7,
++                params=CheckpointCmd(label="forced-error"),
++                generation=15,
++            )
++        )
++
++        seg = segment_queue.get(timeout=1.0)
++        assert isinstance(seg, ErrorSegment)
++        assert seg.generation == 15
+ 
+     def test_home_produces_inline_and_updates_position(self, worker, segment_queue):
+         """Home command should produce InlineSegment and update planner position."""
+@@ -173,25 +207,38 @@ class TestPlannerDirect:
+         """MoveJ r>0, MoveJ r>0, MoveJ r=0 should produce a blended segment."""
+         # r=10 -> buffer
+         worker.process_command(
+-            PlanCommand(command_index=0, params=_make_movej_cmd(W1, r=10.0))
++            PlanCommand(
++                command_index=0,
++                params=_make_movej_cmd(W1, r=10.0),
++                generation=14,
++            )
+         )
+         assert len(worker._planner._blend_buffer) == 1
+ 
+         # r=10 -> buffer
+         worker.process_command(
+-            PlanCommand(command_index=1, params=_make_movej_cmd(W2, r=10.0))
++            PlanCommand(
++                command_index=1,
++                params=_make_movej_cmd(W2, r=10.0),
++                generation=14,
++            )
+         )
+         assert len(worker._planner._blend_buffer) == 2
+ 
+         # r=0 -> flush
+         worker.process_command(
+-            PlanCommand(command_index=2, params=_make_movej_cmd(W3, r=0.0))
++            PlanCommand(
++                command_index=2,
++                params=_make_movej_cmd(W3, r=0.0),
++                generation=14,
++            )
+         )
+         assert len(worker._planner._blend_buffer) == 0
+ 
+         seg = segment_queue.get(timeout=1.0)
+         assert isinstance(seg, TrajectorySegment)
+         assert seg.command_index == 0
++        assert seg.generation == 14
+         assert seg.trajectory_steps.shape[0] > 0
+         # Should have consumed commands 1 and 2
+         assert len(seg.blend_consumed_indices) > 0
+@@ -220,7 +267,11 @@ class TestPlannerDirect:
+     def test_stale_blend_flushed_on_timeout(self, worker, segment_queue):
+         """flush_stale_blend should emit buffered trajectory."""
+         worker.process_command(
+-            PlanCommand(command_index=0, params=_make_movej_cmd(W1, r=10.0))
++            PlanCommand(
++                command_index=0,
++                params=_make_movej_cmd(W1, r=10.0),
++                generation=16,
++            )
+         )
+         assert len(worker._planner._blend_buffer) == 1
+ 
+@@ -230,6 +281,7 @@ class TestPlannerDirect:
+         seg = segment_queue.get(timeout=1.0)
+         assert isinstance(seg, TrajectorySegment)
+         assert seg.command_index == 0
++        assert seg.generation == 16
+ 
+     def test_cancel_clears_blend_buffer(self, worker, segment_queue):
+         """cancel() should clear the blend buffer."""
+@@ -247,6 +299,35 @@ class TestPlannerDirect:
+ # ---------------------------------------------------------------------------
+ 
+ 
++class TestPlannerGeneration:
++    """Main-process planner epoch stamping without a worker subprocess."""
++
++    def test_cancel_advances_epoch_and_stamps_new_plans(self):
++        planner = MotionPlanner()
++
++        old_plan = PlanCommand(
++            command_index=1,
++            params=CheckpointCmd(label="old"),
++            generation=999,
++        )
++        planner.submit(old_plan)
++        queued_old = planner._command_queue.get(timeout=1.0)
++        assert queued_old.generation == 0
++
++        planner.cancel()
++        cancel = planner._command_queue.get(timeout=1.0)
++        assert isinstance(cancel, CancelAll)
++        assert cancel.generation == 1
++
++        new_plan = PlanCommand(
++            command_index=2,
++            params=CheckpointCmd(label="new"),
++        )
++        planner.submit(new_plan)
++        queued_new = planner._command_queue.get(timeout=1.0)
++        assert queued_new.generation == 1
++
++
+ class TestPlannerSubprocess:
+     """Test the planner running in a real subprocess."""
+ 
+@@ -441,25 +522,85 @@ class TestSegmentPlayer:
+         assert state.last_checkpoint == "after_move"
+ 
+     def test_cancel_clears_everything(self, state):
+-        """Cancel should clear active segment and buffer."""
++        """Cancel should clear playback and terminal action bookkeeping."""
+         planner = MotionPlanner()
+         player = SegmentPlayer(planner)
+ 
+         steps = np.tile(_home_steps(), (100, 1))
+-        seg = TrajectorySegment(command_index=0, trajectory_steps=steps, duration=1.0)
++        seg = TrajectorySegment(
++            command_index=0,
++            trajectory_steps=steps,
++            duration=1.0,
++            command_name="MoveJCommand",
++            action_params="angles=[...]",
++        )
+         player._buffer.append(seg)
+ 
+         # Start playing
+         assert player.tick(state) is True
++        assert state.action_current == "MoveJCommand"
++        assert state.action_state == ActionState.EXECUTING
+ 
+         # Cancel
+         player.cancel(state)
+         assert player._active is None
+         assert len(player._buffer) == 0
++        assert state.queued_segments == 0
++        assert state.queued_duration == 0.0
++        assert state.action_current == ""
++        assert state.action_params == ""
++        assert state.action_state == ActionState.IDLE
+ 
+         # Should return False now
+         assert player.tick(state) is False
+ 
++    def test_cancel_drops_late_old_generation_and_accepts_current(self, state):
++        """A segment arriving after cancel must never be replayed."""
++        planner = MotionPlanner()
++        # A synchronous local queue makes the late-arrival ordering fully
++        # deterministic without starting a subprocess.
++        planner._segment_queue = queue.Queue()
++        player = SegmentPlayer(planner)
++
++        old_generation = planner._generation
++        player.cancel(state)
++        current_generation = planner._generation
++        assert current_generation == old_generation + 1
++
++        late_steps = np.tile(_home_steps(), (2, 1))
++        late_steps[:, 0] += 100
++        planner._segment_queue.put(
++            TrajectorySegment(
++                command_index=41,
++                trajectory_steps=late_steps,
++                duration=0.02,
++                generation=old_generation,
++                command_name="MoveJCommand",
++            )
++        )
++
++        before = state.Position_out.copy()
++        assert player.tick(state) is False
++        np.testing.assert_array_equal(state.Position_out, before)
++        assert state.executing_command_index != 41
++        assert player.active is False
++
++        current_steps = np.tile(_home_steps(), (2, 1))
++        current_steps[:, 0] += 200
++        planner._segment_queue.put(
++            TrajectorySegment(
++                command_index=42,
++                trajectory_steps=current_steps,
++                duration=0.02,
++                generation=current_generation,
++                command_name="MoveJCommand",
++            )
++        )
++
++        assert player.tick(state) is True
++        assert state.executing_command_index == 42
++        np.testing.assert_array_equal(state.Position_out, current_steps[0])
++
+     def test_blend_consumed_indices(self, state):
+         """Blended segment should report max consumed index on completion."""
+         planner = MotionPlanner()
+diff --git a/tests/unit/test_reset_command.py b/tests/unit/test_reset_command.py
+index b631369..9179836 100644
+--- a/tests/unit/test_reset_command.py
++++ b/tests/unit/test_reset_command.py
+@@ -37,7 +37,8 @@ class TestResetCommandExecution:
+ 
+         assert state.e_stop_active is False
+         assert state.soft_error is False
+-        assert state.disabled_reason == ""
++        assert state.enabled is False
++        assert state.disabled_reason == "Firmware reset; RESUME required"
+ 
+     def test_reset_clears_tool(self):
+         """Reset should reset tool to NONE."""

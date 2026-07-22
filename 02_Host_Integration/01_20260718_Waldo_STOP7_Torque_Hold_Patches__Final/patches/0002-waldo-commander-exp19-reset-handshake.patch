@@ -1,0 +1,527 @@
+diff --git a/tests/test_camera_service.py b/tests/test_camera_service.py
+index 94c1ff2..0bef18a 100644
+--- a/tests/test_camera_service.py
++++ b/tests/test_camera_service.py
+@@ -11,6 +11,7 @@ from waldo_commander.services.camera_service import (
+     LinuxpyBackend,
+     OpenCVBackend,
+     _BLACK_1PX,
++    enumerate_video_devices,
+ )
+ 
+ # A minimal valid JPEG (1x1 white pixel).
+@@ -123,3 +124,39 @@ def test_backend_fallback_to_opencv_when_linuxpy_fails():
+     assert cs.active
+     assert open_calls == ["linuxpy", "opencv"]
+     cs.stop()
++
++
++@pytest.mark.unit
++def test_camera_disable_env_prevents_backend_open():
++    """The opt-out must block both camera backends before hardware access."""
++    cs = CameraService()
++
++    with (
++        patch.dict("os.environ", {"WALDO_DISABLE_CAMERA": "1"}),
++        patch("waldo_commander.services.camera_service.LinuxpyBackend") as linuxpy,
++        patch("waldo_commander.services.camera_service.OpenCVBackend") as opencv,
++    ):
++        cs.start(0)
++
++    assert not cs.active
++    assert cs.get_latest_frame() == _BLACK_1PX
++    linuxpy.assert_not_called()
++    opencv.assert_not_called()
++
++
++@pytest.mark.unit
++def test_camera_disable_env_prevents_device_enumeration():
++    """The opt-out must avoid OpenCV and v4l2 discovery probes."""
++    with (
++        patch.dict("os.environ", {"WALDO_DISABLE_CAMERA": "true"}),
++        patch(
++            "waldo_commander.services.camera_service._enumerate_v4l2"
++        ) as enumerate_v4l2,
++        patch(
++            "waldo_commander.services.camera_service._enumerate_opencv"
++        ) as enumerate_opencv,
++    ):
++        assert enumerate_video_devices() == []
++
++    enumerate_v4l2.assert_not_called()
++    enumerate_opencv.assert_not_called()
+diff --git a/tests/test_control_panel_modes_and_estop.py b/tests/test_control_panel_modes_and_estop.py
+index 2222278..d773635 100644
+--- a/tests/test_control_panel_modes_and_estop.py
++++ b/tests/test_control_panel_modes_and_estop.py
+@@ -57,7 +57,7 @@ async def test_home_command_behavior(
+ 
+ @pytest.mark.integration
+ async def test_digital_estop_dialog_behavior(user: User) -> None:
+-    """Digital E-STOP dialog should appear with Resume button."""
++    """Digital motion-stop dialog should appear with Resume button."""
+     await user.open("/")
+     await wait_for_app_ready()
+ 
+@@ -66,8 +66,8 @@ async def test_digital_estop_dialog_behavior(user: User) -> None:
+     await asyncio.sleep(0.1)
+ 
+     # Dialog should appear with correct content
+-    await user.should_see("Digital E-STOP Active")
+-    await user.should_see("Robot motion has been stopped.")
++    await user.should_see("Digital Motion Stop Active")
++    await user.should_see("holding torque remains active")
+ 
+     # Resume button should be present (marked for testability)
+     resume_btn = user.find(marker="btn-estop-resume")
+diff --git a/tests/test_exp19_reset_handshake_source.py b/tests/test_exp19_reset_handshake_source.py
+new file mode 100644
+index 0000000..a49dc1e
+--- /dev/null
++++ b/tests/test_exp19_reset_handshake_source.py
+@@ -0,0 +1,122 @@
++"""Source contracts for the Exp19 real-hardware reset handshake."""
++
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[1]
++CONTROL = (ROOT / "waldo_commander" / "components" / "control.py").read_text(
++    encoding="utf-8"
++)
++MAIN = (ROOT / "waldo_commander" / "main.py").read_text(encoding="utf-8")
++
++
++def _function_block(source: str, start: str, end: str) -> str:
++    return source.split(start, 1)[1].split(end, 1)[0]
++
++
++def test_physical_release_keeps_explicit_reset_action_visible() -> None:
++    block = _function_block(
++        CONTROL,
++        "    def check_state_change(self) -> None:",
++        "\n\nclass _ToolQuickActions:",
++    )
++    assert "Awaiting explicit Reset & Resume" in block
++    assert "self.close()" not in block
++
++
++def test_estop_ui_reports_safety_reset_state_without_claiming_button_pressed() -> None:
++    show_block = _function_block(
++        CONTROL,
++        "    def show(self, is_physical: bool) -> None:",
++        "\n\n    def close(self) -> None:",
++    )
++    assert "STOP7 / Safety Reset Required" in show_block
++    assert "remains latched" in show_block
++    assert "Confirm the physical E-STOP is released" in show_block
++    assert "The physical E-STOP button was pressed" not in show_block
++    assert '"Reset & Resume", on_click=reset_and_resume' in show_block
++
++
++def test_first_zero_ack_is_not_logged_as_a_physical_stop_edge() -> None:
++    init_block = _function_block(
++        CONTROL,
++        '    def __init__(self, client: "RobotClient", ui_client_fn: Callable[[], Any]) -> None:',
++        "\n\n    def show(self, is_physical: bool) -> None:",
++    )
++    state_block = _function_block(
++        CONTROL,
++        "    def check_state_change(self) -> None:",
++        "\n\nclass _ToolQuickActions:",
++    )
++    assert "self._last_io_state: int | None = None" in init_block
++    assert "if self._last_io_state is None:" in state_block
++    assert "safety reset required at startup" in state_block
++
++
++def test_digital_stop_resumes_without_resetting_firmware() -> None:
++    show_block = _function_block(
++        CONTROL,
++        "    def show(self, is_physical: bool) -> None:",
++        "\n\n    def close(self) -> None:",
++    )
++    digital_callback = _function_block(
++        show_block,
++        "                async def resume_digital_stop() -> None:",
++        "\n\n                if is_physical:",
++    )
++    assert "await self._client.resume()" in digital_callback
++    assert "_reset_and_verify_hardware_safe" not in digital_callback
++    assert "client.reset" not in digital_callback
++    assert "holding torque remains active" in show_block
++    assert 'ui.button("Resume", on_click=resume_digital_stop)' in show_block
++
++
++def test_reset_helper_waits_for_stop7_latch_ack() -> None:
++    block = _function_block(
++        CONTROL,
++        'async def _reset_and_verify_hardware_safe(client: "RobotClient") -> bool:',
++        "\n\n@dataclasses.dataclass",
++    )
++    assert "await asyncio.sleep(0.06)" in block
++    assert "await client.reset()" in block
++    assert "io_state[4] == 1" in block
++    assert "return False" in block
++
++
++def test_real_hardware_startup_never_auto_resumes() -> None:
++    initial_mode = _function_block(
++        MAIN,
++        "    async def _set_initial_mode(port: str) -> None:",
++        "\n\n    async def _restore_settings()",
++    )
++    hardware_branch = initial_mode.split("        else:", 1)[1]
++    assert "await client.halt()" in hardware_branch
++    assert "await client.resume()" not in hardware_branch
++
++    page_init = _function_block(
++        MAIN,
++        "            async def _init():",
++        "\n\n            ui.timer(",
++    )
++    hardware_switch = page_init.split(
++        "if hw_now and waldoctl.commander.status.simulator_active:", 1
++    )[1]
++    assert "await client.halt()" in hardware_switch
++    assert "await client.resume()" not in hardware_switch
++
++
++def test_manual_simulator_to_hardware_never_auto_resumes() -> None:
++    toggle = _function_block(
++        CONTROL,
++        "    async def on_toggle_sim(self) -> None:",
++        "\n\n    async def on_estop_click(self) -> None:",
++    )
++    hardware_switch = toggle.split(
++        "            else:\n"
++        "                await self.client.simulator(False)",
++        1,
++    )[1]
++    assert "await self.client.halt()" in hardware_switch
++    assert "self.estop.show(is_physical=False)" in hardware_switch
++    assert "_reset_and_verify_hardware_safe" not in hardware_switch
++    assert "await self.client.resume()" not in hardware_switch
+diff --git a/waldo_commander/components/control.py b/waldo_commander/components/control.py
+index 62261be..9089b9c 100644
+--- a/waldo_commander/components/control.py
++++ b/waldo_commander/components/control.py
+@@ -63,6 +63,23 @@ _RE_TEXT_LABEL = re.compile(r"(<text\b[^>]*>)(.*?)(</text>)", re.DOTALL)
+ _RE_WHITESPACE = re.compile(r"\s+")
+ 
+ 
++async def _reset_and_verify_hardware_safe(client: "RobotClient") -> bool:
++    """Send one reset edge and wait for Exp19's STOP7 latch acknowledgement."""
++    # STOP7 must be closed continuously for the firmware's 50 ms guard.
++    await asyncio.sleep(0.06)
++    await client.reset()
++
++    # Exp19 maps io[4] to STOP7 closed AND both BootResetRequired/EstopOpen
++    # clear, so a high value acknowledges the accepted CLEAR_ERROR(103) edge.
++    await asyncio.sleep(0.10)
++    for _ in range(20):
++        io_state = await client.io()
++        if io_state and len(io_state) > 4 and io_state[4] == 1:
++            return True
++        await asyncio.sleep(0.05)
++    return False
++
++
+ @dataclasses.dataclass
+ class _CadenceTracker:
+     """Tracks timer cadence and warns on drift."""
+@@ -105,7 +122,10 @@ class _EStopManager:
+         self._ui_client_fn = ui_client_fn
+         self._dialog: ui.dialog | None = None
+         self._is_physical: bool = False
+-        self._last_io_state: int = 1
++        # ``io.estop`` is the firmware's reset acknowledgement, not the raw
++        # STOP7 pin. At boot it is 0 even when the NC loop is already closed,
++        # so the first sample must not be presented as a physical 1 -> 0 edge.
++        self._last_io_state: int | None = None
+         self._digital_active: bool = False
+ 
+     def show(self, is_physical: bool) -> None:
+@@ -137,34 +157,58 @@ class _EStopManager:
+                     sanitize=False,
+                 ).classes("w-96")
+ 
++                async def reset_and_resume() -> None:
++                    try:
++                        if not await _reset_and_verify_hardware_safe(self._client):
++                            ui.notify(
++                                "Reset was not accepted. Confirm the physical "
++                                "E-STOP is released, wait, and retry.",
++                                color="warning",
++                            )
++                            return
++
++                        await self._client.resume()
++                        self._digital_active = False
++                        self.close()
++                    except Exception as e:
++                        logger.error("Reset/resume after E-STOP failed: %s", e)
++
++                async def resume_digital_stop() -> None:
++                    try:
++                        # Digital HALT never sets a firmware fault latch and
++                        # must not call RESET/CLEAR_ERROR: firmware manualReset
++                        # deliberately drops EN. Resume alone reauthorizes
++                        # motion while preserving the held motor state.
++                        await self._client.resume()
++                        self._digital_active = False
++                        self.close()
++                    except Exception as e:
++                        logger.error("Resume after digital motion stop failed: %s", e)
++
+                 if is_physical:
+-                    ui.label("Physical E-STOP Active").classes(
++                    ui.label("STOP7 / Safety Reset Required").classes(
+                         "text-xl font-bold text-negative text-center"
+                     )
+-                    ui.label("The physical E-STOP button was pressed.").classes(
+-                        "text-center"
+-                    )
+-                    ui.label("To continue, unset the E-STOP button.").classes(
++                    ui.label("Robot motion is stopped and remains latched.").classes(
+                         "text-center"
+                     )
++                    ui.label(
++                        "Confirm the physical E-STOP is released, then use "
++                        "Reset & Resume."
++                    ).classes("text-center")
++                    with ui.row().classes("gap-2 justify-center w-full mt-4"):
++                        ui.button(
++                            "Reset & Resume", on_click=reset_and_resume
++                        ).props("color=positive size=lg").mark("btn-estop-resume")
+                 else:
+-                    ui.label("Digital E-STOP Active").classes(
++                    ui.label("Digital Motion Stop Active").classes(
+                         "text-xl font-bold text-warning text-center"
+                     )
+-                    ui.label("Robot motion has been stopped.").classes("text-center")
+-
+-                    async def resume():
+-                        try:
+-                            await self._client.resume()
+-                            self._digital_active = False
+-                            if self._dialog:
+-                                self._dialog.close()
+-                                self._dialog = None
+-                        except Exception as e:
+-                            logger.error("Resume after digital E-STOP failed: %s", e)
+-
++                    ui.label(
++                        "Robot motion is stopped; holding torque remains active."
++                    ).classes("text-center")
+                     with ui.row().classes("gap-2 justify-center w-full mt-4"):
+-                        ui.button("Resume", on_click=resume).props(
++                        ui.button("Resume", on_click=resume_digital_stop).props(
+                             "color=positive size=lg"
+                         ).mark("btn-estop-resume")
+ 
+@@ -185,15 +229,26 @@ class _EStopManager:
+         """Monitor ``commander.status.io.estop`` and show/hide dialog on transitions."""
+         current = waldoctl.commander.status.io.estop
+ 
++        if self._last_io_state is None:
++            self._last_io_state = current
++            if current == 0:
++                logger.warning(
++                    "STOP7 / safety reset required at startup "
++                    "(io.estop acknowledgement=0)"
++                )
++                self.show(is_physical=True)
++            return
++
+         if self._last_io_state == 1 and current == 0:
+-            logger.warning("Physical E-STOP detected (io.estop 1->0)")
++            logger.warning("STOP7 / safety reset required (io.estop 1->0)")
+             self.show(is_physical=True)
+         elif self._last_io_state == 0 and current == 1:
+-            logger.info("Physical E-STOP released (io.estop 0->1)")
++            logger.info("STOP7 / safety reset acknowledged (io.estop 0->1)")
+             if self._dialog and self._is_physical:
+-                self.close()
+-                if self._digital_active:
+-                    self.show(is_physical=False)
++                # Keep the persistent dialog and its explicit Reset & Resume
++                # action visible until the callback verifies safety and closes
++                # it. Closing here made normal release-then-reset impossible.
++                logger.info("Awaiting explicit Reset & Resume")
+ 
+         self._last_io_state = current
+ 
+@@ -1493,9 +1548,20 @@ class ControlPanel:
+                 if self._is_urdf_scene_valid() and ui_state.urdf_scene:
+                     ui_state.urdf_scene.set_simulator_appearance(False)
+                 try:
+-                    await self.client.resume()
++                    # Selecting real hardware is never authority to reset or
++                    # resume it.  Enter the same torque-holding digital stop
++                    # used by the red UI button and require an explicit
++                    # operator Resume (or physical STOP7 Reset & Resume).
++                    await self.client.halt()
++                    if self.estop:
++                        self.estop._digital_active = True
++                        self.estop.show(is_physical=False)
++                    ui.notify(
++                        "Hardware selected with motion stopped; explicit Resume required",
++                        color="warning",
++                    )
+                 except Exception as e:
+-                    logger.warning("Resume after simulator off failed: %s", e)
++                    logger.warning("Hardware motion-stop after simulator off failed: %s", e)
+ 
+         except Exception as ex:
+             ui.notify(f"Simulator toggle failed: {ex}", color="negative")
+@@ -1507,9 +1573,13 @@ class ControlPanel:
+             playback.sync_mode()
+ 
+     async def on_estop_click(self) -> None:
+-        """Trigger digital E-STOP (STOP command) and show dialog."""
++        """Trigger a torque-holding digital motion stop and show its dialog."""
+         if waldoctl.commander.status.io.estop == 0:
+-            ui.notify("Physical E-STOP is active - release it first", color="warning")
++            ui.notify(
++                "Safety reset is pending - confirm the physical E-STOP is "
++                "released and use Reset & Resume first",
++                color="warning",
++            )
+             return
+ 
+         await self.client.halt()
+@@ -2156,7 +2226,7 @@ class ControlPanel:
+                     icon="dangerous", color="negative", on_click=self.on_estop_click
+                 ).props("round unelevated").classes("glass-btn text-2xl").style(
+                     "position: absolute; top: -18px; left: 10px;"
+-                ).tooltip("E-Stop (Esc)").mark("btn-estop")
++                ).tooltip("Digital motion stop (torque held) (Esc)").mark("btn-estop")
+ 
+     def cleanup(self) -> None:
+         """Cancel background timers during shutdown."""
+diff --git a/waldo_commander/components/help_menu.py b/waldo_commander/components/help_menu.py
+index 8570428..27ea3e3 100644
+--- a/waldo_commander/components/help_menu.py
++++ b/waldo_commander/components/help_menu.py
+@@ -247,7 +247,7 @@ class HelpMenu:
+                                 "This software provides no safety guarantees and assumes no liability",
+                                 "User accepts full responsibility for robot operation",
+                                 "Simulator mode is not physics-accurate and does not guarantee repeatability on real hardware",
+-                                "The digital E-STOP is not a substitute for the hardware emergency stop",
++                                "The digital motion stop preserves holding torque and is not a substitute for the hardware emergency stop or 24 V cutoff",
+                                 "Incorrect kinematics calculations could result in sudden robotic movements",
+                                 "Keep clear of all moving parts during operation",
+                             ]
+diff --git a/waldo_commander/components/io.py b/waldo_commander/components/io.py
+index 758d234..087b152 100644
+--- a/waldo_commander/components/io.py
++++ b/waldo_commander/components/io.py
+@@ -52,7 +52,7 @@ class IoPage:
+                     .bind_text_from(
+                         io,
+                         "estop",
+-                        backward=lambda v: f"ESTOP: {'OK' if v else 'TRIGGERED'}",
++                        backward=lambda v: f"ESTOP: {'OK' if v else 'LATCHED'}",
+                     )
+                     .classes("text-sm")
+                 )
+diff --git a/waldo_commander/main.py b/waldo_commander/main.py
+index 43d8142..8073aca 100644
+--- a/waldo_commander/main.py
++++ b/waldo_commander/main.py
+@@ -902,7 +902,10 @@ def build_page_content() -> None:
+                     waldoctl.commander.status.simulator_active = False
+                     try:
+                         await client.simulator(False)
+-                        await client.resume()
++                        # A detected real board enters host motion-stop. HALT
++                        # preserves existing motor holding torque; only the
++                        # physical 24 V cutoff is a software-independent stop.
++                        await client.halt()
+                     except Exception as e:
+                         logger.warning("auto robot-mode switch failed: %s", e)
+                 waldoctl.commander.status.connected = hw_now
+@@ -1075,10 +1078,18 @@ def _register_handlers() -> None:
+             except Exception as e:
+                 logger.error("startup: simulator(True) failed: %s", e)
+             waldoctl.commander.status.simulator_active = True
+-        try:
+-            await client.resume()
+-        except Exception as e:
+-            logger.warning("startup: resume failed (may retry): %s", e)
++            try:
++                await client.resume()
++            except Exception as e:
++                logger.warning("startup: simulator resume failed: %s", e)
++        else:
++            try:
++                # Never auto-enable configured real hardware at application
++                # startup. HALT cancels motion but preserves holding torque if
++                # the firmware was already armed.
++                await client.halt()
++            except Exception as e:
++                logger.warning("startup: hardware halt failed: %s", e)
+ 
+     async def _restore_settings() -> None:
+         """Restore persisted motion profile and tool selection."""
+diff --git a/waldo_commander/services/camera_service.py b/waldo_commander/services/camera_service.py
+index 1f67300..136eba4 100644
+--- a/waldo_commander/services/camera_service.py
++++ b/waldo_commander/services/camera_service.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ import asyncio
+ import base64
+ import logging
++import os
+ import sys
+ from typing import Protocol
+ 
+@@ -39,6 +40,13 @@ _PLACEHOLDER = Response(content=_BLACK_1PX, media_type="image/png")
+ 
+ _STREAM_FPS = 30
+ _STREAM_BOUNDARY = b"frame"
++_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
++
++
++def _camera_access_disabled() -> bool:
++    """Return whether all local camera discovery and capture is disabled."""
++    value = os.getenv("WALDO_DISABLE_CAMERA", "")
++    return value.strip().lower() in _TRUE_VALUES
+ 
+ 
+ class CaptureBackend(Protocol):
+@@ -178,6 +186,10 @@ class CameraService:
+         """Open a camera device and begin capturing."""
+         self.stop()
+ 
++        if _camera_access_disabled():
++            logger.info("Camera access disabled by WALDO_DISABLE_CAMERA")
++            return
++
+         backend: CaptureBackend | None = None
+ 
+         if sys.platform == "linux" and isinstance(device, int):
+@@ -243,6 +255,9 @@ def enumerate_video_devices(max_check: int = 10) -> list[dict[str, int | str]]:
+ 
+     Returns a list of ``{"index": int, "label": str}`` dicts.
+     """
++    if _camera_access_disabled():
++        return []
++
+     if sys.platform == "linux":
+         devs = _enumerate_v4l2(max_check)
+         if devs is not None:
+diff --git a/waldo_commander/services/keybindings.py b/waldo_commander/services/keybindings.py
+index 2eb2051..6e46892 100644
+--- a/waldo_commander/services/keybindings.py
++++ b/waldo_commander/services/keybindings.py
+@@ -326,7 +326,7 @@ def _register_default_keybindings() -> None:
+         Keybinding(
+             key="Escape",
+             display="Esc",
+-            description="Emergency Stop",
++            description="Digital Motion Stop (torque held)",
+             action=lambda: asyncio.create_task(cp.on_estop_click()),
+             category="Robot Control",
+         )

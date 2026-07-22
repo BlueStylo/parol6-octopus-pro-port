@@ -1,0 +1,21 @@
+format_version = 1
+
+repository = "https://github.com/PCrnjak/PAROL6-Desktop-robot-arm.git"
+license = "GPL-3.0"
+firmware_subdirectory = "PAROL6 control board main software"
+
+# Exp23 inherits this locally verified, clean firmware revision from Exp22.
+pinned_commit = "896fa9fd793a076a0b3790b8a4a29a6f5bb12fcb"
+pinned_commit_date = "2026-05-05T16:26:42+02:00"
+pinned_commit_subject = "update building instructions"
+pinned_firmware_tree = "2bac41ef589ae8e253384a977c83b8526726becc"
+comparison_checkout = "external; set PAROL6_UPSTREAM_FIRMWARE_DIR"
+
+# Informational remote check made on 2026-07-18 Asia/Seoul.
+# This does not move the pinned basis above.
+remote_checked_date = "2026-07-18"
+remote_main_commit = "77597de127a844990965189f0e6062e2551a2842"
+remote_main_commit_date = "2026-07-07T12:27:20+02:00"
+remote_main_commit_subject = "BOM update"
+remote_main_firmware_tree = "2bac41ef589ae8e253384a977c83b8526726becc"
+remote_firmware_identical_to_pinned = true

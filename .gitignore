@@ -11,12 +11,20 @@
 99_Temp/
 90_Archive/
 
-# Upstream source mirror. Keep upstream as an external reference instead of
-# vendoring the whole PAROL6 repository into this work log.
-02_Source/01_PAROL6_Desktop_Robot_Arm__Upstream/
+# Local upstream checkouts and experiment workspaces are intentionally not
+# part of the public release.
+/02_Source/
+/05_Experiments/
+/tmp/
+/PAROL_*.command
 
 # PlatformIO and firmware build artifacts
 **/.pio/
+**/.pio-core/
+**/.uv-cache/
+**/.uv-tools/
+**/__pycache__/
+.venv/
 **/.pioenvs/
 **/.piolibdeps/
 **/.sconsign*.dblite

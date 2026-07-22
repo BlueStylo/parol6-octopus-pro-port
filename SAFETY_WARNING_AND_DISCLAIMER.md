@@ -22,10 +22,18 @@ Minimum safety expectations:
 - Do not connect 24 V sensors directly to MCU-level inputs.
 - Verify every driver enable, step, direction, chip-select, limit, and E-stop
   signal before connecting the robot drivetrain.
-- Use a real hardware E-stop path that removes motor power or disables drivers
-  independently of firmware.
+- STOP7 in this port is a software halt that intentionally retains holding
+  torque. It is not a certified hard E-stop and cannot replace an independent,
+  immediately accessible 24 V power cutoff.
+- Removing motor power can allow gravity-loaded joints to fall. Support the arm
+  and assess that hazard before using the hard power cutoff.
 - Do not run automatic homing or motion until sensor polarity and joint
   direction are confirmed at low power.
+- Do not leave the robot unattended while energized.
+
+The pneumatic FAN0 output has no safety watchdog. A communications disconnect
+or STOP7 event may leave its last commanded state active; design the pneumatic
+system so loss of control cannot create a hazardous state.
 
 This is not an official Source Robotics project and is not a certified safety
 system.

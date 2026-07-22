@@ -1,0 +1,2 @@
+b0cb210d047bd6df79d75583b1ceb87cb07609777c1953fc8a04a156c7372dcd  patches/0001-parol6-api-v0.3.1-clear-error-103.patch
+2aff7ea99d450b26099d0a719cf39738010a07e2d8994cf0313ca988259d3804  patches/0002-waldo-commander-exp19-reset-handshake.patch

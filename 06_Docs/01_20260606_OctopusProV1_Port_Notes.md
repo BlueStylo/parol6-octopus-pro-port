@@ -1,5 +1,11 @@
 # Octopus Pro V1.0 F446 PAROL6 Firmware Port Notes
 
+> **폐기된 초기 초안 / SUPERSEDED DRAFT**
+>
+> 이 문서의 MOTOR0–MOTOR5 배선은 최종 실물 구성과 다릅니다. 실제 배선에는
+> [`02_20260722_Final_Wiring_and_Pin_Map.md`](02_20260722_Final_Wiring_and_Pin_Map.md)를
+> 사용하세요.
+
 ## Status
 
 - Working copy: `03_Board_Firmware/01_20260606_OctopusProV1_Port__InProgress`

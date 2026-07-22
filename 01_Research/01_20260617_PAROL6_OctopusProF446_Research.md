@@ -1,5 +1,12 @@
 # PAROL6 + BTT Octopus Pro F446 Research Notes
 
+> **SUPERSEDED BASELINE — DO NOT USE FOR FINAL WIRING.**
+>
+> This document records the initial research stage and contains the abandoned
+> MOTOR0–MOTOR5 draft mapping. Use the
+> [validated final wiring map](../06_Docs/02_20260722_Final_Wiring_and_Pin_Map.md)
+> for the completed robot.
+
 Date: 2026-06-17
 
 ## Purpose
