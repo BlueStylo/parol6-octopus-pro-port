@@ -1,6 +1,6 @@
 # PAROL6 Octopus Pro Port
 
-[한국어](README.md) · [Safety warning](SAFETY_WARNING_AND_DISCLAIMER.md) · [Wiring map](06_Docs/02_20260722_Final_Wiring_and_Pin_Map.md) · [Firmware binary](07_Output/01_20260722_PAROL6_OctopusPro_v1.0.0__Final/firmware.bin)
+[한국어](README.md) | [Safety warning](SAFETY_WARNING_AND_DISCLAIMER.md) | [Wiring map](06_Docs/02_20260722_Final_Wiring_and_Pin_Map.md) | [Firmware binary](07_Output/01_20260722_PAROL6_OctopusPro_v1.0.0__Final/firmware.bin)
 
 An unofficial port of the original PAROL6 low-level controller firmware to the **BTT Octopus Pro V1.0/V1.0.1 F446**. It retains the PAROL6 56/60-byte wire protocol, joint profiles, and upstream homing state machine as literally as possible while adapting board pins, drivers, USB, STOP7, and auxiliary outputs.
 
@@ -101,11 +101,11 @@ For a 24V FAN0 load, place that port on `VIN/V_FUSED` and verify coil rating, po
 
 ## Repository layout
 
-- `02_Host_Integration/` — host patches preserving STOP7 recovery semantics
-- `03_Board_Firmware/02_...__Final/` — reproducible final firmware source
-- `04_3D_Printing/` — enclosure STL files for Octopus Pro and four 4040 fans
-- `06_Docs/` — final wiring, flashing, and validation documents
-- `07_Output/01_...v1.0.0__Final/` — release binary, checksum, and release notes
+- `02_Host_Integration/`: host patches preserving STOP7 recovery semantics
+- `03_Board_Firmware/02_...__Final/`: reproducible final firmware source
+- `04_3D_Printing/`: enclosure STL files for Octopus Pro and four 4040 fans
+- `06_Docs/`: final wiring, flashing, and validation documents
+- `07_Output/01_...v1.0.0__Final/`: release binary, checksum, and release notes
 
 The firmware directory numbered `01` and the 2026-06-06 notes are superseded development drafts and must not be used for final wiring.
 
